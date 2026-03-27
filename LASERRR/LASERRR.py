@@ -766,7 +766,7 @@ if not IS_WINDOWS:
 #PI_SERVER_PATH = '/home/aptyp/sensor_server.py'
 #PI_TCP_PORT = 5000
 
-PI_IP = '192.168.1.37'
+PI_IP = '192.168.1.36'
 PI_USER = 'rock'
 PI_PASS = 'rock'
 PI_SERVER_PATH = '/home/rock/sensor_server.py'
