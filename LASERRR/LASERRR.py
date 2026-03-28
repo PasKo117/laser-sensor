@@ -52,16 +52,16 @@ streaming = False
 stream_clients = []
 stream_lock = threading.Lock()
 
-def calculate_bcc(data_bytes):
+def calculate_bcc(data_bytes): #вычисляем BCC
     bcc = 0
     for byte in data_bytes: bcc ^= byte
     return bcc
 
-def build_command(command, data1, data2):
+def build_command(command, data1, data2): #сбор пакета
     bcc = calculate_bcc([command, data1, data2])
     return bytes([STX, command, data1, data2, ETX, bcc])
 
-def open_serial():
+def open_serial(): #открытие Serial порта
     global ser
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, bytesize=serial.EIGHTBITS,
@@ -72,7 +72,7 @@ def open_serial():
         print(f"[PI] Serial Error: {e}")
         return False
 
-def send_command(command, data1, data2, wait_time=0.05):
+def send_command(command, data1, data2, wait_time=0.05): #сбор,  отправка команды
     global ser
     if not ser or not ser.is_open: return None, "Port Closed"
     with lock:
@@ -84,7 +84,7 @@ def send_command(command, data1, data2, wait_time=0.05):
         response = ser.read(20)
     return response, None
 
-def parse_response(response):
+def parse_response(response): #проверка, не наебнулся ли ответ
     if not response or len(response) < 6: return None, None, "Short"
     if response[0] != STX: return None, None, "NoSTX"
     if response[1] == NAK: return None, None, f"NAK(0x{response[2]:02X})"
@@ -94,7 +94,7 @@ def parse_response(response):
     if response[4] != ETX: return None, None, "NoETX"
     return response[2], response[3], "OK"
 
-def read_measurement():
+def read_measurement(): #чтение расстояния
     resp, err = send_command(CMD_READ_MEASUREMENT, 0xB0, 0x01)
     if err: return None, err
     upper, lower, status = parse_response(resp)
@@ -102,70 +102,71 @@ def read_measurement():
     val = struct.unpack('>h', bytes([upper, lower]))[0]
     return val, "OK"
 
-def read_model_type():
+def read_model_type(): #чтение модели датчика (хотя нахуй оно нужно)
     upper, lower, status = read_setting(0x01, 0x00)
     if status != "OK": return 'B035', status
     return {0x0F:'B015',0x23:'B035',0x64:'B100'}.get(upper, 'B035'), "OK"
 
-def read_setting(addr_h, addr_l):
+def read_setting(addr_h, addr_l): #чтение настроек с подкоманд h l
     resp, err = send_command(CMD_READ_SETTING, addr_h, addr_l)
     if err: return None, None, err
     return parse_response(resp)
 
-def read_output_status():
+def read_output_status(): #чтение статуса выхода 
     resp, err = send_command(CMD_READ_MEASUREMENT, 0xB0, 0x02)
     if err: return None, err
     upper, lower, status = parse_response(resp)
     if status != "OK": return None, status
     return (lower & 0x01) == 1, "OK"
 
-def write_to_eeprom():
+def write_to_eeprom(): #сохранение настроек в EEPROM, настройка без этого исчезнет
     resp, err = send_command(CMD_READ_MEASUREMENT, 0xA0, 0x00)
     return err or parse_response(resp)[2] if resp else "Err"
 
-def dismiss_setting():
+def dismiss_setting(): #отмена настроек до предыдущего значения
     resp, err = send_command(CMD_READ_MEASUREMENT, 0xA0, 0x01)
     return err or parse_response(resp)[2] if resp else "Err"
 
-def laser_control(on_off):
+def laser_control(on_off): #включение/выключение лазера (ну больше как режим сна)
     resp, err = send_command(CMD_READ_MEASUREMENT, 0xA0, 0x03 if on_off else 0x02)
     return err or parse_response(resp)[2] if resp else "Err"
 
-def zero_reset(execute):
+def zero_reset(execute): #сброс настроек нуля расстояния
     resp, err = send_command(CMD_READ_MEASUREMENT, 0xA1, 0x00 if execute else 0x01)
     return err or parse_response(resp)[2] if resp else "Err"
 
-def key_lock(execute):
+def key_lock(execute): #а нахуя кнопки тебе, выключаем
     resp, err = send_command(CMD_READ_MEASUREMENT, 0xA1, 0x04 if execute else 0x05)
     return err or parse_response(resp)[2] if resp else "Err"
 
-def initialize_sensor():
+def initialize_sensor(): #сборс настроек до завода (к хуям собачьим)
     resp, err = send_command(CMD_READ_MEASUREMENT, 0x40, 0x00)
     return err or parse_response(resp)[2] if resp else "Err"
 
-def write_setting(addr_h, addr_l, val_h, val_l):
+def write_setting(addr_h, addr_l, val_h, val_l): #для записи настроек
     _,_,st = read_setting(addr_h, addr_l)
     if st != "OK": return st
     resp, err = send_command(CMD_WRITE_SETTING, val_h, val_l)
     return err or parse_response(resp)[2] if resp else "Err"
 
-def _to_raw(mm):
+def _to_raw(mm): #перевод в мм
     unit = 0.001 if model_type=='B015' else 0.01
     return int(mm / unit)
 
-def _split(val): return (val>>8)&0xFF, val&0xFF
+def _split(val): return (val>>8)&0xFF, val&0xFF #вспомогательное, разбиение на 2 байта
 
-def _save(addr_h, addr_l, mm):
+def _save(addr_h, addr_l, mm): #вспомогательная
     raw = _to_raw(mm); u,l = _split(raw)
     st = write_setting(addr_h, addr_l, u, l)
     return write_to_eeprom() if st=="OK" else st
 
-def set_measurement_mode(mode):
+def set_measurement_mode(mode): #уст.настр. режима измерения по мануалу
     m = {'2pt':(0,0),'1pt':(0,1),'obsb':(0,2)}.get(mode)
     if m is None: return "BadMode"
     st = write_setting(0x40,0x04,*m)
     return write_to_eeprom() if st=="OK" else st
 
+#с мануала
 def set_near_threshold(mm): return _save(0x41,0x00,mm)
 def set_far_threshold(mm): return _save(0x41,0x02,mm)
 def set_obsb_threshold(mm): return _save(0x41,0x04,mm)
@@ -173,48 +174,48 @@ def set_obsb_hysteresis(mm): return _save(0x41,0x06,mm)
 def set_hysteresis(mm): return _save(0x41,0x10,mm)
 def set_zero_shift(mm): return _save(0x41,0x12,mm)
 
-def set_output_polarity(pol):
+def set_output_polarity(pol): #уст.настр. полярности выхода
     m = {'light_on':(0,0),'dark_on':(0,1)}.get(pol)
     if m is None: return "BadPol"
     st = write_setting(0x40,0x08,*m)
     return write_to_eeprom() if st=="OK" else st
 
-def set_sampling_period(per):
+def set_sampling_period(per): #уст.настр. периода дискретизации
     m = {'500us':(0,0),'1000us':(0,1),'2000us':(0,2),'4000us':(0,3),'auto':(0,4)}.get(per)
-    if m is None: return "BadPeriod"
+    if m is None: return "BadPeriod, try 500/1000/2000/4000us OR auto"
     st = write_setting(0x40,0x06,*m)
     return write_to_eeprom() if st=="OK" else st
 
-def set_averaging(cnt):
+def set_averaging(cnt): #уст.наст. установки усреднения
     m = {'1':(0,0),'8':(0,1),'64':(0,2),'512':(0,3)}.get(cnt)
-    if m is None: return "BadAvg"
+    if m is None: return "BadAvg, pls try: 1/8/64/512"
     st = write_setting(0x40,0x0A,*m)
     return write_to_eeprom() if st=="OK" else st
 
-def set_alarm(alarm):
+def set_alarm(alarm): #уст.наст. типа тревоги
     m = {'clamp':(0,0),'hold':(0,1)}.get(alarm)
-    if m is None: return "BadAlarm"
+    if m is None: return "BadAlarm, try clamp/hold"
     st = write_setting(0x40,0x0C,*m)
     return write_to_eeprom() if st=="OK" else st
 
-def set_alarm_hold(val):
+def set_alarm_hold(val): #уст.наст. удержания тревоги
     u,l = _split(int(val))
     st = write_setting(0x41,0x08,u,l)
     return write_to_eeprom() if st=="OK" else st
 
-def set_display(on_off):
+def set_display(on_off): #настройки дисплея
     m = {'on':(0,0),'off':(0,1)}.get(on_off)
-    if m is None: return "BadDisp"
+    if m is None: return "BadDisp, try on/off"
     st = write_setting(0x40,0x0E,*m)
     return write_to_eeprom() if st=="OK" else st
 
-def set_threshold(level):
+def set_threshold(level): #уст.наст. порога
     m = {'base':(0,0),'p400':(0,1),'p200':(0,2),'p100':(0,3)}.get(level)
-    if m is None: return "BadLevel"
+    if m is None: return "BadLevel, try base/p400/p200/p100"
     st = write_setting(0x40,0x12,*m)
     return write_to_eeprom() if st=="OK" else st
 
-def set_sensitivity(sens):
+def set_sensitivity(sens): #установка чувствительности
     m = {'auto':(0,0)}.get(sens)
     if m is None:
         try:
@@ -225,7 +226,7 @@ def set_sensitivity(sens):
     st = write_setting(0x40,0x14,*m)
     return write_to_eeprom() if st=="OK" else st
 
-def read_all_settings():
+def read_all_settings(): #чтение всех нахуй настроек
     s = {}
     def get(addr_h, addr_l, name, mapping=None):
         u,l,st = read_setting(addr_h, addr_l)
@@ -242,7 +243,7 @@ def read_all_settings():
     elif u is not None: s['Sensitivity']=str(l)
     return s
 
-def stream_sender():
+def stream_sender(): #стрим... сюда лучше сильно не лезть пока.. но надо бы
     """Отдельный поток для рассылки стрим-данных"""
     global streaming, stream_clients, model_type
     while True:
@@ -266,7 +267,7 @@ def stream_sender():
                 print(f"[PI] StreamErr: {e}")
         time.sleep(0.05)
 
-def handle_client(conn, addr):
+def handle_client(conn, addr): #приём JSON
     global streaming, model_type, stream_clients
     print(f"[PI] Client: {addr}")
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -433,7 +434,7 @@ class SensorClient:
             print("\n[!] Установите paramiko: pip install paramiko")
             return None
 
-    def deploy_to_pi(self):
+    def deploy_to_pi(self): #развёртывание сервера на пк
         paramiko = self._import_paramiko()
         if not paramiko:
             return False
@@ -469,7 +470,7 @@ class SensorClient:
             print(f"[-] SSH ошибка: {e}")
             return False
 
-    def connect_tcp(self):
+    def connect_tcp(self): #подключение по TCP
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(5)
@@ -487,8 +488,7 @@ class SensorClient:
             print(f"[-] TCP ошибка: {e}")
             return False
 
-    def _stream_listener(self):
-        """Фоновый поток для приёма стрим-данных"""
+    def _stream_listener(self): #Фоновый поток для приёма стрим-данных //надо бы уменьшить пинг
         buffer = ""
         while self.running and self.connected:
             try:
@@ -515,7 +515,7 @@ class SensorClient:
                     print(f"[-] Stream listener error: {e}")
                 break
 
-    def _send_command(self, action, **kw):
+    def _send_command(self, action, **kw): #отправка команд
         if not self.sock:
             return None
         try:
@@ -685,7 +685,7 @@ def print_menu():
     print("  [0] Выход   |   [M] Меню   |   [Q] Завершить")
     print("═"*80)
 
-def _input_num(prompt, min_v=None, max_v=None):
+def _input_num(prompt, min_v=None, max_v=None): #проверка диапазона
     try:
         v = float(input(prompt).strip())
         if min_v is not None and v < min_v:
@@ -697,13 +697,13 @@ def _input_num(prompt, min_v=None, max_v=None):
         print("  ✗ Неверное значение")
         return None
 
-def menu_numeric(client, prompt, setter, unit="мм", min_v=None, max_v=None):
+def menu_numeric(client, prompt, setter, unit="мм", min_v=None, max_v=None): #проверка численных значений со ввода
     v = _input_num(f"  {prompt} ({unit}): ", min_v, max_v)
     if v is not None:
         r = setter(v)
         print(f"  {'✓' if r and r.get('status')=='ok' else '✗'} Результат: {r.get('status') if r else 'NoResp'}")
 
-def handle_menu(client):
+def handle_menu(client): #обработка ввода выбор -> 
     print_menu()
     ch = input("\n  Выбор: ").strip().upper()
     if ch == '0':
@@ -822,7 +822,7 @@ def handle_menu(client):
         print("  ✗ Неверный выбор")
     return True
 
-def kbhit_windows():
+def kbhit_windows(): #проверка нажатия клавиш
     try:
         import msvcrt
         if msvcrt.kbhit():
@@ -831,7 +831,7 @@ def kbhit_windows():
         pass
     return None
 
-def stream_loop(client):
+def stream_loop(client): #цикл стриминга данных
     print("\n  ▶ Непрерывный режим. [S] стоп, [Q] выход.")
     count = 0
     start_time = time.time()
