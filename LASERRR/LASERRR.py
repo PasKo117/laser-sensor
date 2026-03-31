@@ -38,7 +38,7 @@ PI_SSH_PORT = 22
 PI_SERVER_CODE = r'''#!/usr/bin/env python3
 import serial, time, struct, socket, json, threading, sys
 
-SERIAL_PORT = '/dev/ttyUSB0'
+SERIAL_PORT = '/dev/ttyUSB0'                                    #USB меняется в зависимости от порта подключения
 BAUD_RATE = 9600
 TIMEOUT = 0.3
 
