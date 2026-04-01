@@ -1,0 +1,994 @@
+"""
+SICK OD Mini Pro — Stable Single Connection Version
+"""
+
+import socket
+import json
+import threading
+import time
+import sys
+import os
+from datetime import datetime
+
+IS_WINDOWS = sys.platform == 'win32'
+if not IS_WINDOWS:
+    import termios, tty, select
+
+# ============================================================================
+# КОНФИГУРАЦИЯ
+# ============================================================================
+# PI_IP = '192.168.1.41'
+# PI_USER = 'aptyp'
+# PI_PASS = 'aptyp'
+# PI_SERVER_PATH = '/home/aptyp/sensor_server.py'
+# PI_TCP_PORT = 5000
+
+#PI_IP = '192.168.1.37'
+#PI_USER = 'rock'
+#PI_PASS = 'rock'
+#PI_SERVER_PATH = '/home/rock/sensor_server.py'
+#PI_TCP_PORT = 5000
+
+PI_IP = '192.168.2.37'
+PI_USER = 'pi'
+PI_PASS = 'rasprobot1'
+PI_SERVER_PATH = '/home/pi/sensor_server.py'
+PI_TCP_PORT = 5000
+
+PI_SSH_PORT = 22
+
+# ============================================================================
+# СЕРВЕРНЫЙ КОД ДЛЯ RASPBERRY PI (FIXED)
+# ============================================================================
+PI_SERVER_CODE = r'''#!/usr/bin/env python3
+import serial, time, struct, socket, json, threading, sys
+
+SERIAL_PORT = '/dev/ttyUSB2'                                    #USB меняется в зависимости от порта подключения         1-свободный     2-на резаке
+BAUD_RATE = 9600
+TIMEOUT = 0.3
+
+STX, ETX, ACK, NAK = 0x02, 0x03, 0x06, 0x15
+CMD_READ_MEASUREMENT, CMD_WRITE_SETTING, CMD_READ_SETTING = 0x43, 0x57, 0x52
+
+ser = None
+model_type = 'B035'
+lock = threading.Lock()
+streaming = False
+stream_clients = []
+stream_lock = threading.Lock()
+
+def calculate_bcc(data_bytes): #вычисляем BCC
+    bcc = 0
+    for byte in data_bytes: bcc ^= byte
+    return bcc
+
+def build_command(command, data1, data2): #сбор пакета
+    bcc = calculate_bcc([command, data1, data2])
+    return bytes([STX, command, data1, data2, ETX, bcc])
+
+def open_serial(): #открытие Serial порта
+    global ser
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, bytesize=serial.EIGHTBITS,
+                           parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=TIMEOUT)
+        print(f"[PI] Port {SERIAL_PORT} opened @ {BAUD_RATE}")
+        return True
+    except Exception as e:
+        print(f"[PI] Serial Error: {e}")
+        return False
+
+def send_command(command, data1, data2, wait_time=0.05): #сбор,  отправка команды
+    global ser
+    if not ser or not ser.is_open: return None, "Port Closed"
+    with lock:
+        cmd = build_command(command, data1, data2)
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        ser.write(cmd)
+        time.sleep(wait_time)
+        response = ser.read(20)
+    return response, None
+
+def parse_response(response): #проверка, не наебнулся ли ответ
+    if not response or len(response) < 6: return None, None, "Short"
+    if response[0] != STX: return None, None, "NoSTX"
+    if response[1] == NAK: return None, None, f"NAK(0x{response[2]:02X})"
+    if response[1] != ACK: return None, None, "NoACK"
+    exp_bcc = calculate_bcc([response[1], response[2], response[3]])
+    if response[5] != exp_bcc: return None, None, "BadBCC"
+    if response[4] != ETX: return None, None, "NoETX"
+    return response[2], response[3], "OK"
+
+def read_measurement(): #чтение расстояния
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0xB0, 0x01)
+    if err: return None, err
+    upper, lower, status = parse_response(resp)
+    if status != "OK": return None, status
+    val = struct.unpack('>h', bytes([upper, lower]))[0]
+    return val, "OK"
+
+def read_model_type(): #чтение модели датчика (хотя нахуй оно нужно)
+    upper, lower, status = read_setting(0x01, 0x00)
+    if status != "OK": return 'B035', status
+    return {0x0F:'B015',0x23:'B035',0x64:'B100'}.get(upper, 'B035'), "OK"
+
+def read_setting(addr_h, addr_l): #чтение настроек с подкоманд h l
+    resp, err = send_command(CMD_READ_SETTING, addr_h, addr_l)
+    if err: return None, None, err
+    return parse_response(resp)
+
+def read_output_status(): #чтение статуса выхода 
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0xB0, 0x02)
+    if err: return None, err
+    upper, lower, status = parse_response(resp)
+    if status != "OK": return None, status
+    return (lower & 0x01) == 1, "OK"
+
+def write_to_eeprom(): #сохранение настроек в EEPROM, настройка без этого исчезнет
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0xA0, 0x00)
+    return err or parse_response(resp)[2] if resp else "Err"
+
+def dismiss_setting(): #отмена настроек до предыдущего значения
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0xA0, 0x01)
+    return err or parse_response(resp)[2] if resp else "Err"
+
+def laser_control(on_off): #включение/выключение лазера (ну больше как режим сна)
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0xA0, 0x03 if on_off else 0x02)
+    return err or parse_response(resp)[2] if resp else "Err"
+
+def zero_reset(execute): #сброс настроек нуля расстояния
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0xA1, 0x00 if execute else 0x01)
+    return err or parse_response(resp)[2] if resp else "Err"
+
+def key_lock(execute): #а нахуя кнопки тебе, выключаем
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0xA1, 0x04 if execute else 0x05)
+    return err or parse_response(resp)[2] if resp else "Err"
+
+def initialize_sensor(): #сборс настроек до завода (к хуям собачьим)
+    resp, err = send_command(CMD_READ_MEASUREMENT, 0x40, 0x00)
+    return err or parse_response(resp)[2] if resp else "Err"
+
+def write_setting(addr_h, addr_l, val_h, val_l): #для записи настроек
+    _,_,st = read_setting(addr_h, addr_l)
+    if st != "OK": return st
+    resp, err = send_command(CMD_WRITE_SETTING, val_h, val_l)
+    return err or parse_response(resp)[2] if resp else "Err"
+
+def _to_raw(mm): #перевод в мм
+    unit = 0.001 if model_type=='B015' else 0.01
+    return int(mm / unit)
+
+def _split(val): return (val>>8)&0xFF, val&0xFF #вспомогательное, разбиение на 2 байта
+
+def _save(addr_h, addr_l, mm): #вспомогательная
+    raw = _to_raw(mm); u,l = _split(raw)
+    st = write_setting(addr_h, addr_l, u, l)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_measurement_mode(mode): #уст.настр. режима измерения по мануалу
+    m = {'2pt':(0,0),'1pt':(0,1),'obsb':(0,2)}.get(mode)
+    if m is None: return "BadMode"
+    st = write_setting(0x40,0x04,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+#с мануала
+def set_near_threshold(mm): return _save(0x41,0x00,mm)
+def set_far_threshold(mm): return _save(0x41,0x02,mm)
+def set_obsb_threshold(mm): return _save(0x41,0x04,mm)
+def set_obsb_hysteresis(mm): return _save(0x41,0x06,mm)
+def set_hysteresis(mm): return _save(0x41,0x10,mm)
+def set_zero_shift(mm): return _save(0x41,0x12,mm)
+
+def set_output_polarity(pol): #уст.настр. полярности выхода
+    m = {'light_on':(0,0),'dark_on':(0,1)}.get(pol)
+    if m is None: return "BadPol"
+    st = write_setting(0x40,0x08,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_sampling_period(per): #уст.настр. периода дискретизации
+    m = {'500us':(0,0),'1000us':(0,1),'2000us':(0,2),'4000us':(0,3),'auto':(0,4)}.get(per)
+    if m is None: return "BadPeriod, try 500/1000/2000/4000us OR auto"
+    st = write_setting(0x40,0x06,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_averaging(cnt): #уст.наст. установки усреднения
+    m = {'1':(0,0),'8':(0,1),'64':(0,2),'512':(0,3)}.get(cnt)
+    if m is None: return "BadAvg, pls try: 1/8/64/512"
+    st = write_setting(0x40,0x0A,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_alarm(alarm): #уст.наст. типа тревоги
+    m = {'clamp':(0,0),'hold':(0,1)}.get(alarm)
+    if m is None: return "BadAlarm, try clamp/hold"
+    st = write_setting(0x40,0x0C,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_alarm_hold(val): #уст.наст. удержания тревоги
+    u,l = _split(int(val))
+    st = write_setting(0x41,0x08,u,l)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_display(on_off): #настройки дисплея
+    m = {'on':(0,0),'off':(0,1)}.get(on_off)
+    if m is None: return "BadDisp, try on/off"
+    st = write_setting(0x40,0x0E,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_threshold(level): #уст.наст. порога
+    m = {'base':(0,0),'p400':(0,1),'p200':(0,2),'p100':(0,3)}.get(level)
+    if m is None: return "BadLevel, try base/p400/p200/p100"
+    st = write_setting(0x40,0x12,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+def set_sensitivity(sens): #установка чувствительности
+    m = {'auto':(0,0)}.get(sens)
+    if m is None:
+        try:
+            n=int(sens)
+            if 1<=n<=6: m=(0,n)
+        except: pass
+    if m is None: return "BadSens"
+    st = write_setting(0x40,0x14,*m)
+    return write_to_eeprom() if st=="OK" else st
+
+def read_all_settings(): #чтение всех нахуй настроек
+    s = {}
+    def get(addr_h, addr_l, name, mapping=None):
+        u,l,st = read_setting(addr_h, addr_l)
+        if st=="OK" and mapping: s[name] = mapping.get((u,l), f"0x{u:02X}{l:02X}")
+        elif st=="OK": s[name] = f"0x{u:02X}{l:02X}"
+    get(0x40,0x04,'Mode',{(0,0):'2-Pt',(0,1):'1-Pt',(0,2):'ObSB'})
+    get(0x40,0x06,'Sampling',{(0,0):'500us',(0,1):'1ms',(0,2):'2ms',(0,3):'4ms',(0,4):'AUTO'})
+    get(0x40,0x0A,'Averaging',{(0,0):'1',(0,1):'8',(0,2):'64',(0,3):'512'})
+    get(0x40,0x08,'Polarity',{(0,0):'LightON',(0,1):'DarkON'})
+    get(0x40,0x0C,'Alarm',{(0,0):'Clamp',(0,1):'Hold'})
+    get(0x40,0x0E,'Display',{(0,0):'ON',(0,1):'OFF'})
+    u,l,_ = read_setting(0x40,0x14)
+    if u==0 and l==0: s['Sensitivity']='AUTO'
+    elif u is not None: s['Sensitivity']=str(l)
+    return s
+
+def stream_sender(): #стрим... сюда лучше сильно не лезть пока.. но надо бы
+    """Отдельный поток для рассылки стрим-данных"""
+    global streaming, stream_clients, model_type
+    while True:
+        if streaming:
+            try:
+                val, st = read_measurement()
+                if st == "OK" and val is not None:
+                    unit = 0.001 if model_type=='B015' else 0.01
+                    msg = {"type":"stream","value":val*unit,"raw":val,"ts":time.time()}
+                    data = (json.dumps(msg) + "\n").encode()
+                    with stream_lock:
+                        dead_clients = []
+                        for client in stream_clients:
+                            try:
+                                client.send(data)
+                            except:
+                                dead_clients.append(client)
+                        for client in dead_clients:
+                            stream_clients.remove(client)
+            except Exception as e:
+                print(f"[PI] StreamErr: {e}")
+        time.sleep(0.01)
+
+def handle_client(conn, addr): #приём JSON
+    global streaming, model_type, stream_clients
+    print(f"[PI] Client: {addr}")
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    buffer = ""
+    try:
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buffer += data.decode('utf-8', errors='ignore')
+
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    req = json.loads(line.strip())
+                    act = req.get('action')
+                    resp = {"status":"error","data":None,"msg":"Unknown"}
+
+                    if act == 'ping':
+                        resp = {"status":"ok","data":"pong"}
+                    elif act == 'get_model':
+                        m,_ = read_model_type()
+                        model_type = m
+                        resp = {"status":"ok","data":m}
+                    elif act == 'measure':
+                        val,st = read_measurement()
+                        if st=="OK" and val is not None:
+                            unit = 0.001 if model_type=='B015' else 0.01
+                            resp = {"status":"ok","data":val*unit}
+                        else:
+                            resp = {"status":st,"data":None}
+                    elif act == 'read_status':
+                        v,st = read_output_status()
+                        resp = {"status":st,"data":v}
+                    elif act == 'read_all':
+                        resp = {"status":"ok","data":read_all_settings()}
+                    elif act == 'write_eeprom':
+                        resp = {"status":write_to_eeprom()}
+                    elif act == 'dismiss':
+                        resp = {"status":dismiss_setting()}
+                    elif act == 'laser_on':
+                        resp = {"status":laser_control(True)}
+                    elif act == 'laser_off':
+                        resp = {"status":laser_control(False)}
+                    elif act == 'zero_reset':
+                        resp = {"status":zero_reset(True)}
+                    elif act == 'zero_restore':
+                        resp = {"status":zero_reset(False)}
+                    elif act == 'key_lock':
+                        resp = {"status":key_lock(True)}
+                    elif act == 'key_unlock':
+                        resp = {"status":key_lock(False)}
+                    elif act == 'init_sensor':
+                        resp = {"status":initialize_sensor()}
+                    elif act == 'set_mode':
+                        resp = {"status":set_measurement_mode(req.get('mode'))}
+                    elif act == 'set_sampling':
+                        resp = {"status":set_sampling_period(req.get('period'))}
+                    elif act == 'set_averaging':
+                        resp = {"status":set_averaging(req.get('count'))}
+                    elif act == 'set_polarity':
+                        resp = {"status":set_output_polarity(req.get('polarity'))}
+                    elif act == 'set_alarm':
+                        resp = {"status":set_alarm(req.get('type'))}
+                    elif act == 'set_display':
+                        resp = {"status":set_display(req.get('on_off'))}
+                    elif act == 'set_sensitivity':
+                        resp = {"status":set_sensitivity(req.get('sens'))}
+                    elif act == 'set_threshold':
+                        resp = {"status":set_threshold(req.get('level'))}
+                    elif act == 'set_near':
+                        resp = {"status":set_near_threshold(req.get('mm'))}
+                    elif act == 'set_far':
+                        resp = {"status":set_far_threshold(req.get('mm'))}
+                    elif act == 'set_obsb':
+                        resp = {"status":set_obsb_threshold(req.get('mm'))}
+                    elif act == 'set_obsb_hyst':
+                        resp = {"status":set_obsb_hysteresis(req.get('mm'))}
+                    elif act == 'set_hyst':
+                        resp = {"status":set_hysteresis(req.get('mm'))}
+                    elif act == 'set_zero_shift':
+                        resp = {"status":set_zero_shift(req.get('mm'))}
+                    elif act == 'set_alarm_hold':
+                        resp = {"status":set_alarm_hold(req.get('value'))}
+                    elif act == 'stream_start':
+                        with stream_lock:
+                            if conn not in stream_clients:
+                                stream_clients.append(conn)
+                            streaming = True
+                        resp = {"status":"ok","data":"started"}
+                    elif act == 'stream_stop':
+                        with stream_lock:
+                            if conn in stream_clients:
+                                stream_clients.remove(conn)
+                            if not stream_clients:
+                                streaming = False
+                        resp = {"status":"ok","data":"stopped"}
+
+                    conn.send((json.dumps(resp) + "\n").encode())
+                except Exception as e:
+                    print(f"[PI] CmdErr: {e}")
+                    conn.send((json.dumps({"status":"error","msg":str(e)}) + "\n").encode())
+    except Exception as e:
+        print(f"[PI] ClientErr: {e}")
+    finally:
+        with stream_lock:
+            if conn in stream_clients:
+                stream_clients.remove(conn)
+            if not stream_clients:
+                streaming = False
+        conn.close()
+
+def main():
+    global model_type
+    if not open_serial():
+        sys.exit(1)
+    m,_ = read_model_type()
+    model_type = m
+    print(f"[PI] Model: {model_type}")
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('0.0.0.0', PI_TCP_PORT))
+    srv.listen(5)
+    print(f"[PI] Listening :{PI_TCP_PORT}")
+
+    t_stream = threading.Thread(target=stream_sender, daemon=True)
+    t_stream.start()
+
+    while True:
+        conn, addr = srv.accept()
+        t1 = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+        t1.start()
+
+if __name__ == '__main__':
+    PI_TCP_PORT = 5000
+    main()
+'''
+
+
+# ============================================================================
+# КЛИЕНТ (ПК)
+# ============================================================================
+
+class SensorClient:
+    def __init__(self):
+        self.sock = None
+        self.connected = False
+        self.model = "B035"
+        self.streaming = False
+        self.stream_buffer = ""
+        self.last_stream_value = None
+        self.stream_lock = threading.Lock()
+        self.stream_thread = None
+        self.running = True
+
+    def _import_paramiko(self):
+        try:
+            import paramiko
+            return paramiko
+        except ImportError:
+            print("\n[!] Установите paramiko: pip install paramiko")
+            return None
+
+    def deploy_to_pi(self):  # развёртывание сервера на пк
+        paramiko = self._import_paramiko()
+        if not paramiko:
+            return False
+        print(f"[*] SSH: {PI_USER}@{PI_IP}...")
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(PI_IP, username=PI_USER, password=PI_PASS, port=PI_SSH_PORT, timeout=10)
+
+            print("[*] Проверка зависимостей...")
+            ssh.exec_command("sudo apt update -qq")
+            _, stdout, _ = ssh.exec_command("python3 -c 'import serial' 2>/dev/null; echo $?")
+            if stdout.read().strip().decode() != "0":
+                print("[*] Установка python3-serial...")
+                _, out, _ = ssh.exec_command("sudo apt install python3-serial -y -qq", timeout=180)
+                if out.channel.recv_exit_status() != 0:
+                    print("[-] Ошибка установки")
+                    ssh.close()
+                    return False
+
+            sftp = ssh.open_sftp()
+            with sftp.file(PI_SERVER_PATH, 'w') as f:
+                f.write(PI_SERVER_CODE)
+
+            ssh.exec_command(f"pkill -f '{PI_SERVER_PATH}' 2>/dev/null || true")
+            time.sleep(0.3)
+            ssh.exec_command(f"nohup python3 {PI_SERVER_PATH} > /tmp/sensor.log 2>&1 &")
+
+            ssh.close()
+            time.sleep(1.5)
+            return True
+        except Exception as e:
+            print(f"[-] SSH ошибка: {e}")
+            return False
+
+    def connect_tcp(self, max_attempts=5):
+        """Подключение по TCP с повторными попытками"""
+        for attempt in range(max_attempts):
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(2)  # быстрый таймаут для проверки
+                self.sock.connect((PI_IP, PI_TCP_PORT))
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock.settimeout(None)  # дальше без таймаута
+                self.connected = True
+                print(f"[+] TCP: {PI_IP}:{PI_TCP_PORT}")
+
+                # Запуск потока для приёма стрим-данных
+                self.stream_thread = threading.Thread(target=self._stream_listener, daemon=True)
+                self.stream_thread.start()
+                return True
+
+            except Exception as e:
+                print(f"[-] Попытка {attempt + 1}/{max_attempts}: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except:
+                        pass
+        return False
+
+    def _stream_listener(self):  # Фоновый поток для приёма стрим-данных //надо бы уменьшить пинг
+        buffer = ""
+        while self.running and self.connected:
+            try:
+                self.sock.settimeout(0.4)
+                chunk = self.sock.recv(4096).decode('utf-8', errors='ignore')
+                if not chunk:
+                    continue
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line.strip())
+                        if msg.get('type') == 'stream':
+                            with self.stream_lock:
+                                self.last_stream_value = msg.get('value')
+                    except:
+                        pass
+            except socket.timeout:
+                pass
+            except Exception as e:
+                if self.running:
+                    print(f"[-] Stream listener error: {e}")
+                break
+
+    def _send_command(self, action, max_retries=5, **kw):
+        """Отправка команды с автоматическими повторными попытками"""
+        if not self.sock:
+            return None
+
+        for attempt in range(max_retries):
+            try:
+                req = json.dumps({"action": action, **kw}).encode() + b"\n"
+                self.sock.sendall(req)
+
+                buffer = ""
+                # Добавляем таймаут для чтения ответа (1.5 сек)
+                self.sock.settimeout(1.5)
+
+                while True:
+                    chunk = self.sock.recv(4096).decode('utf-8', errors='ignore')
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    if "\n" in buffer:
+                        line = buffer.split("\n")[0]
+                        self.sock.settimeout(None)  # сброс таймаута
+                        return json.loads(line.strip())
+
+            except socket.timeout:
+                print(f"[-] Таймаут ({attempt + 1}/{max_retries}), пробую снова...")
+                time.sleep(0.2)  # пауза перед повтором
+                continue
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                print(f"[-] Соединение разорвано: {e}")
+                self.connected = False
+                # Пробуем переподключиться
+                if self._reconnect():
+                    print("[+] Переподключение успешно, повторяю команду...")
+                    continue  # повторяем команду после реконнекта
+                else:
+                    return None
+            except Exception as e:
+                print(f"[-] Ошибка: {e}")
+                self.connected = False
+                if attempt < max_retries - 1:
+                    time.sleep(0.3)
+                    continue
+                return None
+
+        print(f"[-] Не удалось выполнить команду после {max_retries} попыток")
+        return None
+
+    def _reconnect(self, max_attempts=5):
+        """Попытка переподключения к серверу"""
+        print(f"[*] Попытка переподключения к {PI_IP}:{PI_TCP_PORT}...")
+
+        for attempt in range(max_attempts):
+            try:
+                # Закрываем старый сокет если есть
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except:
+                        pass
+                    self.sock = None
+
+                # Пробуем подключиться
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(2)
+                self.sock.connect((PI_IP, PI_TCP_PORT))
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock.settimeout(None)
+
+                self.connected = True
+                print(f"[+] Переподключение успешно!")
+
+                # Перезапускаем поток стриминга если нужно
+                if self.streaming:
+                    self.stream_thread = threading.Thread(target=self._stream_listener, daemon=True)
+                    self.stream_thread.start()
+
+                return True
+
+            except Exception as e:
+                print(f"[-] Попытка {attempt + 1}/{max_attempts} не удалась: {e}")
+                time.sleep(1)  # ждём секунду перед следующей попыткой
+
+        print("[-] Не удалось переподключиться")
+        return self._send_command('ping')
+
+    def get_model(self):
+        r = self._send_command('get_model')
+        if r and r.get('status') == 'ok':
+            self.model = r['data']
+        return r
+
+    def measure(self):
+        r = self._send_command('measure')
+        return (r['data'], r['status']) if r and r.get('status') in ('ok', 'OK') else (
+        None, r.get('status') if r else 'NoResp')
+
+    def read_status(self):
+        return self._send_command('read_status')
+
+    def read_all(self):
+        return self._send_command('read_all')
+
+    def write_eeprom(self):
+        return self._send_command('write_eeprom')
+
+    def dismiss(self):
+        return self._send_command('dismiss')
+
+    def laser_on(self):
+        return self._send_command('laser_on')
+
+    def laser_off(self):
+        return self._send_command('laser_off')
+
+    def zero_reset(self):
+        return self._send_command('zero_reset')
+
+    def zero_restore(self):
+        return self._send_command('zero_restore')
+
+    def key_lock(self):
+        return self._send_command('key_lock')
+
+    def key_unlock(self):
+        return self._send_command('key_unlock')
+
+    def init_sensor(self):
+        return self._send_command('init_sensor')
+
+    def set_mode(self, mode):
+        return self._send_command('set_mode', mode=mode)
+
+    def set_sampling(self, period):
+        return self._send_command('set_sampling', period=period)
+
+    def set_averaging(self, count):
+        return self._send_command('set_averaging', count=count)
+
+    def set_polarity(self, pol):
+        return self._send_command('set_polarity', polarity=pol)
+
+    def set_alarm(self, atype):
+        return self._send_command('set_alarm', type=atype)
+
+    def set_display(self, on_off):
+        return self._send_command('set_display', on_off=on_off)
+
+    def set_sensitivity(self, sens):
+        return self._send_command('set_sensitivity', sens=sens)
+
+    def set_threshold(self, level):
+        return self._send_command('set_threshold', level=level)
+
+    def set_near(self, mm):
+        return self._send_command('set_near', mm=mm)
+
+    def set_far(self, mm):
+        return self._send_command('set_far', mm=mm)
+
+    def set_obsb(self, mm):
+        return self._send_command('set_obsb', mm=mm)
+
+    def set_obsb_hyst(self, mm):
+        return self._send_command('set_obsb_hyst', mm=mm)
+
+    def set_hyst(self, mm):
+        return self._send_command('set_hyst', mm=mm)
+
+    def set_zero_shift(self, mm):
+        return self._send_command('set_zero_shift', mm=mm)
+
+    def set_alarm_hold(self, val):
+        return self._send_command('set_alarm_hold', value=val)
+
+    def stream_start(self):
+        r = self._send_command('stream_start')
+        if r and r.get('status') == 'ok':
+            self.streaming = True
+            return True
+        return False
+
+    def stream_stop(self):
+        r = self._send_command('stream_stop')
+        if r and r.get('status') == 'ok':
+            self.streaming = False
+            return True
+        return False
+
+    def get_stream_value(self):
+        with self.stream_lock:
+            val = self.last_stream_value
+            self.last_stream_value = None
+        return val
+
+
+# ============================================================================
+# МЕНЮ И ИНТЕРФЕЙС
+# ============================================================================
+
+def print_header():
+    print("\n" + "=" * 80)
+    print(" " * 20 + "SICK OD Mini Pro — Stable Version")
+    print(" " * 30 + f"Плата: {PI_IP}")
+    print("=" * 80)
+
+
+def print_menu():
+    print("\n" + "─" * 80)
+    #print("【J4】КОМАНДЫ ЧТЕНИЯ И УПРАВЛЕНИЯ")
+    #print("─" * 80)
+    print("  [1]  Чтение измерения (B0 01)          [2]  Статус выхода (B0 02)")
+    print("  [3]  Тип модели (01 00)                [4]  Все настройки")
+    print("  [5]  Запись в EEPROM (A0 00)           [6]  Отмена настроек (A0 01)")
+    print("  [7]  Лазер ВКЛ (A0 03)                 [8]  Лазер ВЫКЛ (A0 02)")
+    print("  [9]  Сброс нуля (A1 00)                [10] Восст. нуля (A1 01)")
+    print("  [11] Блок. кнопок (A1 04)              [12] Разблок. (A1 05)")
+    print("  [13] Инициализация сенсора (40 00)")
+    #print("\n【J5】НАСТРОЙКА ПАРАМЕТРОВ")
+    #print("─" * 80)
+    print("  [14] Режим измерения (40 04)           [15] Период дискрет. (40 06)")
+    print("  [16] Усреднение (40 0A)                [17] Полярность (40 08)")
+    print("  [18] Тревога (40 0C)                   [19] Дисплей (40 0E)")
+    print("  [20] Чувствительность (40 14)          [21] Уровень порога (40 12)")
+    print("  [22] Порог ближний (41 00)             [23] Порог дальний (41 02)")
+    print("  [24] Порог ObSB (41 04)                [25] Гистерезис ObSB (41 06)")
+    print("  [26] Гистерезис (41 10)                [27] Сдвиг нуля (41 12)")
+    print("  [28] Alarm Hold (41 08)")
+    #print("\n【СТРИМИНГ И ПРОЧЕЕ】")
+    #print("─" * 80)
+    print("  [S]  Непрерывный режим (старт/стоп)    [R]  Обновить данные")
+    #print("\n" + "═" * 80)
+    print("  [0] Выход   |   [M] Меню   |   [Q] Завершить")
+    print("═" * 80)
+
+
+def _input_num(prompt, min_v=None, max_v=None):  # проверка диапазона
+    try:
+        v = float(input(prompt).strip())
+        if min_v is not None and v < min_v:
+            raise ValueError
+        if max_v is not None and v > max_v:
+            raise ValueError
+        return v
+    except:
+        print("  ✗ Неверное значение")
+        return None
+
+
+def menu_numeric(client, prompt, setter, unit="мм", min_v=None, max_v=None):  # проверка численных значений со ввода
+    v = _input_num(f"  {prompt} ({unit}): ", min_v, max_v)
+    if v is not None:
+        r = setter(v)
+        print(f"  {'✓' if r and r.get('status') == 'ok' else '✗'} Результат: {r.get('status') if r else 'NoResp'}")
+
+
+def handle_menu(client):  # обработка ввода выбор ->
+    print_menu()
+    ch = input("\n  Выбор: ").strip().upper()
+    if ch == '0':
+        return False
+    elif ch == 'Q':
+        sys.exit(0)
+    elif ch == 'R':
+        return True
+    if ch == '1':
+        val, st = client.measure()
+        print(f"  {'✓' if st == 'ok' else '✗'} {val:.3f} мм" if val is not None else f"  ✗ {st}")
+    elif ch == '2':
+        r = client.read_status()
+        print(f"  {'✓' if r and r.get('status') == 'ok' else '✗'} Выход: {'ВКЛ' if r and r.get('data') else 'ВЫКЛ'}")
+    elif ch == '3':
+        r = client.get_model()
+        print(f"  {'✓' if r and r.get('status') == 'ok' else '✗'} Модель: OD1-{client.model}")
+    elif ch == '4':
+        r = client.read_all()
+        if r and r.get('status') == 'ok':
+            print("\n  ┌" + "─" * 40 + "┐")
+            for k, v in r['data'].items():
+                print(f"  │ {k:20} : {v:15} │")
+            print("  └" + "─" * 40 + "┘")
+        else:
+            print(f"  ✗ Ошибка: {r.get('status') if r else 'NoResp'}")
+    elif ch == '5':
+        print(f"  {'✓' if client.write_eeprom() else '✗'} EEPROM")
+    elif ch == '6':
+        print(f"  {'✓' if client.dismiss() else '✗'} Отмена")
+    elif ch == '7':
+        print(f"  {'✓' if client.laser_on() else '✗'} Лазер ВКЛ")
+    elif ch == '8':
+        print(f"  {'✓' if client.laser_off() else '✗'} Лазер ВЫКЛ")
+    elif ch == '9':
+        print(f"  {'✓' if client.zero_reset() else '✗'} Сброс нуля")
+    elif ch == '10':
+        print(f"  {'✓' if client.zero_restore() else '✗'} Восст. нуля")
+    elif ch == '11':
+        print(f"  {'✓' if client.key_lock() else '✗'} Блокировка")
+    elif ch == '12':
+        print(f"  {'✓' if client.key_unlock() else '✗'} Разблокировка")
+    elif ch == '13':
+        if input("  ⚠ Сброс всех настроек? (y/n): ").strip().lower() == 'y':
+            print(f"  {'✓' if client.init_sensor() else '✗'} Инициализация")
+    elif ch == '14':
+        print("  [1] 2-Pt  [2] 1-Pt  [3] ObSB")
+        m = {'1': '2pt', '2': '1pt', '3': 'obsb'}.get(input("  Выбор: ").strip())
+        if m:
+            print(f"  {'✓' if client.set_mode(m) else '✗'} Режим")
+    elif ch == '15':
+        print("  [1] 500μs  [2] 1ms  [3] 2ms  [4] 4ms  [5] AUTO")
+        p = {'1': '500us', '2': '1000us', '3': '2000us', '4': '4000us', '5': 'auto'}.get(input("  Выбор: ").strip())
+        if p:
+            print(f"  {'✓' if client.set_sampling(p) else '✗'} Период")
+    elif ch == '16':
+        print("  [1] ×1  [2] ×8  [3] ×64  [4] ×512")
+        c = {'1': '1', '2': '8', '3': '64', '4': '512'}.get(input("  Выбор: ").strip())
+        if c:
+            print(f"  {'✓' if client.set_averaging(c) else '✗'} Усреднение")
+    elif ch == '17':
+        print("  [1] Light ON  [2] Dark ON")
+        p = {'1': 'light_on', '2': 'dark_on'}.get(input("  Выбор: ").strip())
+        if p:
+            print(f"  {'✓' if client.set_polarity(p) else '✗'} Полярность")
+    elif ch == '18':
+        print("  [1] Clamp  [2] Hold")
+        a = {'1': 'clamp', '2': 'hold'}.get(input("  Выбор: ").strip())
+        if a:
+            print(f"  {'✓' if client.set_alarm(a) else '✗'} Тревога")
+    elif ch == '19':
+        print("  [1] ВКЛ  [2] ВЫКЛ")
+        d = {'1': 'on', '2': 'off'}.get(input("  Выбор: ").strip())
+        if d:
+            print(f"  {'✓' if client.set_display(d) else '✗'} Дисплей")
+    elif ch == '20':
+        print("  [1] AUTO  [2-7] 1...6")
+        s = {'1': 'auto'}.get(input("  Выбор: ").strip())
+        if not s and input("  Число (1-6): ").strip() in '123456':
+            s = input("  Число: ").strip()
+        if s:
+            print(f"  {'✓' if client.set_sensitivity(s) else '✗'} Чувствительность")
+    elif ch == '21':
+        print("  [1] Base  [2] P400  [3] P200  [4] P100")
+        l = {'1': 'base', '2': 'p400', '3': 'p200', '4': 'p100'}.get(input("  Выбор: ").strip())
+        if l:
+            print(f"  {'✓' if client.set_threshold(l) else '✗'} Порог")
+    elif ch == '22':
+        menu_numeric(client, "Ближний порог", client.set_near)
+    elif ch == '23':
+        menu_numeric(client, "Дальний порог", client.set_far)
+    elif ch == '24':
+        menu_numeric(client, "ObSB порог", client.set_obsb)
+    elif ch == '25':
+        menu_numeric(client, "ObSB гистерезис", client.set_obsb_hyst)
+    elif ch == '26':
+        menu_numeric(client, "Гистерезис", client.set_hyst)
+    elif ch == '27':
+        menu_numeric(client, "Сдвиг нуля", client.set_zero_shift)
+    elif ch == '28':
+        try:
+            v = int(input("  Alarm Hold (0-9999): ").strip())
+            print(f"  {'✓' if client.set_alarm_hold(v) else '✗'} Результат")
+        except:
+            print("  ✗ Ошибка ввода")
+    elif ch == 'S':
+        if client.streaming:
+            client.stream_stop()
+            print("  ⏹ Стриминг остановлен")
+        else:
+            client.stream_start()
+            print("  ▶ Стриминг запущен (нажмите S для остановки)")
+    elif ch == 'M':
+        return True
+    else:
+        print("  ✗ Неверный выбор")
+    return True
+
+
+def kbhit_windows():  # проверка нажатия клавиш
+    try:
+        import msvcrt
+        if msvcrt.kbhit():
+            return msvcrt.getch().decode('utf-8', errors='ignore').strip().upper()
+    except:
+        pass
+    return None
+
+
+def stream_loop(client):  # цикл стриминга данных
+    print("\n  ▶ Непрерывный режим. [S] стоп, [Q] выход.")
+    count = 0
+    start_time = time.time()
+    while client.streaming:
+        val = client.get_stream_value()
+        if val is None:
+            val, st = client.measure()
+        else:
+            st = "ok"
+
+        if val is not None:
+            count += 1
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            fps = count / (time.time() - start_time) if time.time() > start_time else 0
+            sys.stdout.write(f"\r  [{ts}] {val:+9.3f} мм  |  FPS: {fps:4.1f}  |  {st:<6}  ")
+            sys.stdout.flush()
+        time.sleep(0.1)
+
+        if IS_WINDOWS:
+            ch = kbhit_windows()
+            if ch == 'S':
+                client.stream_stop()
+                break
+            elif ch == 'Q':
+                sys.exit(0)
+        else:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                ch = sys.stdin.readline().strip().upper()
+                if ch == 'S':
+                    client.stream_stop()
+                    break
+                elif ch == 'Q':
+                    sys.exit(0)
+    print()
+
+
+def main():
+    client = SensorClient()
+    print_header()
+
+    if not client.deploy_to_pi():
+        print("\n[!] Не удалось подготовить Raspberry Pi")
+        return
+
+    if not client.connect_tcp():
+        print("\n[!] Не удалось подключиться к серверу")
+        return
+
+    client.get_model()
+    print(f"\n Подключено: OD1-{client.model}")
+    print("  Режим: Одно подключение + фоновый стрим-поток")
+    print("  Подсказки: [M] меню, [S] стрим, [Q] выход")
+
+    try:
+        while True:
+            if not client.streaming:
+                if not handle_menu(client):
+                    break
+            else:
+                stream_loop(client)
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n\n  ⚠ Прервано пользователем")
+    finally:
+        client.running = False
+        if client.streaming:
+            client.stream_stop()
+        if client.sock:
+            client.sock.close()
+        print("\n" + "=" * 80 + "\n  Программа завершена.\n" + "=" * 80)
+
+
+if __name__ == '__main__':
+    main()
