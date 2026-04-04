@@ -1,4 +1,4 @@
-﻿"""
+"""
 SICK OD Mini Pro — Stable Dual Sensor Version
 """
 
@@ -644,15 +644,13 @@ class SensorClient:
                         pass
         return False
 
-    def _stream_listener(self):
+    def _stream_listener(self):  # Фоновый поток для приёма стрим-данных //надо бы уменьшить пинг
         buffer = ""
         while self.running and self.connected:
             try:
-                # Windows не любит non-blocking на сокетах — используем try/except
                 self.sock.settimeout(0.4)
                 chunk = self.sock.recv(4096).decode('utf-8', errors='ignore')
                 if not chunk:
-                    time.sleep(0.05)
                     continue
                 buffer += chunk
                 while "\n" in buffer:
@@ -664,19 +662,16 @@ class SensorClient:
                         if msg.get('type') == 'stream':
                             sid = msg.get('sensor_id', 1)
                             with self.stream_lock:
+                                # Сохраняем значение и метку времени обновления
                                 self.last_stream_data[sid] = { 'value': msg.get('value'), 'ts': time.time() }
-                    except json.JSONDecodeError:
+                    except:
                         pass
             except socket.timeout:
                 pass
-            except (ConnectionResetError, BrokenPipeError, OSError):
-                # Сокет закрылся — выходим из потока
-                break
             except Exception as e:
                 if self.running:
                     print(f"[-] Stream listener error: {e}")
                 break
-            time.sleep(0.01)  # Даём потоку "дышать"
 
     def _send_command(self, action, max_retries=5, sensor_id=None, **kw):
         """Отправка команды с автоматическими повторными попытками"""
@@ -1284,12 +1279,8 @@ def main():
                 client.set_active_sensor_for_stream(None)
                 if client.stream_start(sensor_id=None):
                     result = stream_loop(client, [1, 2])
-                    # После возврата из стрима даём буферу stdin очиститься
-                    if not IS_WINDOWS:
-                        import termios
-                        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
                     if result == 'back':
-                        continue
+                        continue  # Возврат в главное меню
             elif ch == '2':  # Стрим только датчик 1
                 client.set_active_sensor_for_stream(1)
                 if client.stream_start(sensor_id=1):
