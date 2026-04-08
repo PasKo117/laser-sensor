@@ -563,10 +563,7 @@ class SensorClient:
         self.streaming = False
         self.stream_paused = False
         self.stream_buffer = ""
-        self.last_stream_data = {
-            1: {'value': None, 'ts': 0},
-            2: {'value': None, 'ts': 0}
-        }
+        self.last_stream_values = {1: None, 2: None}
         self.stream_lock = threading.Lock()
         self.stream_thread = None
         self.running = True
@@ -644,15 +641,13 @@ class SensorClient:
                         pass
         return False
 
-    def _stream_listener(self):
+    def _stream_listener(self):  # Фоновый поток для приёма стрим-данных //надо бы уменьшить пинг
         buffer = ""
         while self.running and self.connected:
             try:
-                # Windows не любит non-blocking на сокетах — используем try/except
                 self.sock.settimeout(0.4)
                 chunk = self.sock.recv(4096).decode('utf-8', errors='ignore')
                 if not chunk:
-                    time.sleep(0.05)
                     continue
                 buffer += chunk
                 while "\n" in buffer:
@@ -664,19 +659,15 @@ class SensorClient:
                         if msg.get('type') == 'stream':
                             sid = msg.get('sensor_id', 1)
                             with self.stream_lock:
-                                self.last_stream_data[sid] = { 'value': msg.get('value'), 'ts': time.time() }
-                    except json.JSONDecodeError:
+                                self.last_stream_values[sid] = msg.get('value')
+                    except:
                         pass
             except socket.timeout:
                 pass
-            except (ConnectionResetError, BrokenPipeError, OSError):
-                # Сокет закрылся — выходим из потока
-                break
             except Exception as e:
                 if self.running:
                     print(f"[-] Stream listener error: {e}")
                 break
-            time.sleep(0.01)  # Даём потоку "дышать"
 
     def _send_command(self, action, max_retries=5, sensor_id=None, **kw):
         """Отправка команды с автоматическими повторными попытками"""
@@ -888,21 +879,8 @@ class SensorClient:
     def get_stream_value(self, sensor_id=1):
         with self.stream_lock:
             val = self.last_stream_values.get(sensor_id)
+            self.last_stream_values[sensor_id] = None
         return val
-
-    def get_stream_value_with_timeout(self, sensor_id=1, max_age_ms=1000):
-        """Возвращает значение, если оно обновлялось за последние max_age_ms миллисекунд."""
-        with self.stream_lock:
-            data = self.last_stream_data.get(sensor_id, {'value': None, 'ts': 0})
-            age_ms = (time.time() - data['ts']) * 1000
-            if age_ms <= max_age_ms:
-                return data['value']
-            return None
-
-    def get_last_known_value(self, sensor_id=1):
-        """Возвращает последнее известное значение без проверки свежести."""
-        with self.stream_lock:
-            return self.last_stream_data.get(sensor_id, {'value': None, 'ts': 0})['value']
 
     def set_active_sensor_for_stream(self, sensor_id):
         """Установка активного датчика для стрима: None=оба, 1 или 2"""
@@ -953,7 +931,7 @@ def print_menu():
     print("  [28] Alarm Hold (41 08)")
     print("  [S]  Стрим старт/стоп                  [P]  Пауза/возобновить стрим")
     print("  [R]  Обновить данные                   [B]  Назад в главное меню")
-    #print("  [0]  Выход   |   [M] Меню   |   [Q] Завершить")
+    print("  [0]  Выход   |   [M] Меню   |   [Q] Завершить")
     print("-" * 80)
 
 
@@ -1136,39 +1114,9 @@ def _getch_linux():
 def stream_loop(client, sensor_ids):  # цикл стриминга данных
     # sensor_ids: список [1], [2] или [1, 2]
     labels = {1: "S1", 2: "S2"}
-    print(f"\n  START Непрерывный режим: {', '.join(labels[sid] for sid in sensor_ids)}.")
-    print("  [S] стоп, [P] пауза, [Q] выход, [B] назад.")
-    sys.stdout.flush()
-
+    print(f"\n  START Непрерывный режим: {', '.join(labels[sid] for sid in sensor_ids)}. [S] стоп, [P] пауза, [Q] выход, [B] назад.")
     count = 0
     start_time = time.time()
-    paused = False
-    exit_flag = [False]  # Используем список для изменения из потока
-    command_queue = []  # Очередь команд от пользователя
-
-    def input_thread_func():
-        """Отдельный поток для чтения команд пользователя"""
-        try:
-            while not exit_flag[0]:
-                try:
-                    # Читаем ввод (блокирующе, но с проверкой флага выхода)
-                    if not IS_WINDOWS:
-                        # Linux: используем sys.stdin.readline
-                        ch = sys.stdin.readline().strip().upper()
-                    else:
-                        ch = input().strip().upper()
-
-                    if ch:
-                        command_queue.append(ch)
-                except:
-                    break
-                time.sleep(0.05)
-        finally:
-            exit_flag[0] = True
-
-    # Запускаем поток ввода
-    input_thread = threading.Thread(target=input_thread_func, daemon=True)
-    input_thread.start()
 
     # Сохраняем настройки терминала для Linux
     fd = None
@@ -1176,55 +1124,21 @@ def stream_loop(client, sensor_ids):  # цикл стриминга данных
     if not IS_WINDOWS:
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
-        tty.setcbreak(fd)  # cbreak вместо raw - позволяет читать по символу
+        tty.setcbreak(fd)
 
     try:
-        while client.streaming and not exit_flag[0]:
-            # === Проверка команд из очереди ===
-            while command_queue:
-                ch = command_queue.pop(0)
-                if ch == 'S':
-                    client.stream_stop()
-                    print("\n  STOP Стриминг остановлен")
-                    sys.stdout.flush()
-                    exit_flag[0] = True
-                    break
-                elif ch == 'P':
-                    paused = not paused
-                    state = "PAUSED" if paused else "RESUMED"
-                    print(f"\n  {state} Стриминг. [P] продолжить, [S] стоп, [B] назад, [Q] выход")
-                    sys.stdout.flush()
-                elif ch == 'Q':
-                    print("\n  Завершение работы...")
-                    sys.stdout.flush()
-                    sys.exit(0)
-                elif ch == 'B':
-                    client.stream_stop()
-                    return 'back'
-
-            if exit_flag[0]:
-                break
-
-            # === Пауза ===
-            if paused:
-                time.sleep(0.1)
-                continue
-
-            # === Получение и отображение значений ===
+        while client.streaming and not client.stream_paused:
             values = {}
             statuses = {}
             for sid in sensor_ids:
-                val = client.get_stream_value_with_timeout(sid, max_age_ms=1000)
+                val = client.get_stream_value(sid)
                 if val is None:
                     val, st = client.measure(sensor_id=sid)
                     statuses[sid] = st
-                    if val is None:
-                        val = client.get_last_known_value(sid)
                 else:
                     statuses[sid] = "ok"
                 values[sid] = val
 
-            # === Отрисовка ===
             if any(v is not None for v in values.values()):
                 count += 1
                 ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1232,6 +1146,7 @@ def stream_loop(client, sensor_ids):  # цикл стриминга данных
                 parts = []
                 for sid in sensor_ids:
                     val = values[sid]
+                    st = statuses[sid]
                     if val is not None:
                         parts.append(f"{labels[sid]}:{val:+8.3f}mm")
                     else:
@@ -1239,18 +1154,55 @@ def stream_loop(client, sensor_ids):  # цикл стриминга данных
                 display = "  ".join(parts)
                 sys.stdout.write(f"\r  [{ts}] {display}  |  FPS: {fps:4.1f}  ")
                 sys.stdout.flush()
-
             time.sleep(0.05)
 
+            # Проверка нажатий клавиш
+            ch = None
+            if IS_WINDOWS:
+                ch = kbhit_windows()
+            else:
+                # Неблокирующая проверка в Linux
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    ch = sys.stdin.read(1).strip().upper()
+
+            if ch:
+                if ch == 'S':
+                    client.stream_stop()
+                    break
+                elif ch == 'P':
+                    client.stream_toggle_pause()
+                    if client.stream_paused:
+                        print("\n  PAUSED Стриминг. Нажмите [P] для возобновления, [S] стоп, [Q] выход, [B] назад.")
+                        # Ждём возобновления или остановки
+                        while client.streaming and client.stream_paused:
+                            time.sleep(0.1)
+                            ch2 = None
+                            if IS_WINDOWS:
+                                ch2 = kbhit_windows()
+                            else:
+                                if select.select([sys.stdin], [], [], 0)[0]:
+                                    ch2 = sys.stdin.read(1).strip().upper()
+                            if ch2 == 'P':
+                                client.stream_toggle_pause()
+                                print(f"\n  RESUMED Стриминг: {', '.join(labels[sid] for sid in sensor_ids)}")
+                                break
+                            elif ch2 == 'S':
+                                client.stream_stop()
+                                break
+                            elif ch2 == 'Q':
+                                sys.exit(0)
+                            elif ch2 == 'B':
+                                client.stream_stop()
+                                return 'back'
+                elif ch == 'Q':
+                    sys.exit(0)
+                elif ch == 'B':
+                    client.stream_stop()
+                    return 'back'
     finally:
-        # Восстановление терминала
+        # Восстанавливаем настройки терминала
         if not IS_WINDOWS and old_settings is not None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-        # Остановка потока ввода
-        exit_flag[0] = True
-        input_thread.join(timeout=0.5)
-
     print()
     return 'continue'
 
@@ -1284,12 +1236,8 @@ def main():
                 client.set_active_sensor_for_stream(None)
                 if client.stream_start(sensor_id=None):
                     result = stream_loop(client, [1, 2])
-                    # После возврата из стрима даём буферу stdin очиститься
-                    if not IS_WINDOWS:
-                        import termios
-                        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
                     if result == 'back':
-                        continue
+                        continue  # Возврат в главное меню
             elif ch == '2':  # Стрим только датчик 1
                 client.set_active_sensor_for_stream(1)
                 if client.stream_start(sensor_id=1):
